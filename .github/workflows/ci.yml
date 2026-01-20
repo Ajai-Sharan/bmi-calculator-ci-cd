@@ -44,7 +44,7 @@ jobs:
         out: "dependency-check-report"
         args: >
           --enableExperimental
-          --nodeAuditSkipDevDependencies
+          --disableNodeAudit
           --failOnCVSS 7
 
     - name: Upload OWASP Dependency-Check SARIF
