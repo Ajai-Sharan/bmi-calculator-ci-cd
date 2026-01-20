@@ -38,7 +38,7 @@ jobs:
     - name: OWASP Dependency-Check (SCA)
       uses: dependency-check/Dependency-Check_Action@main
       with:
-        project: "calculator-api"
+        project: "bmi-calculator-api"
         path: "."
         format: "SARIF"
         out: "dependency-check-report"
@@ -70,7 +70,7 @@ jobs:
     # Docker Build
     # ----------------------------------------------------
     - name: Build Docker image
-      run: docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/calculator-api:latest .
+      run: docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/bmi-calculator-api:latest .
 
     # ----------------------------------------------------
     #  Trivy – Container Image Security Scan
@@ -80,7 +80,7 @@ jobs:
       continue-on-error: true
       with:
         scan-type: image
-        image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/calculator-api:latest
+        image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/bmi-calculator-api:latest
         vuln-type: os,library
         severity: CRITICAL
         ignore-unfixed: true
@@ -102,14 +102,14 @@ jobs:
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
     - name: Push Docker image
-      run: docker push ${{ secrets.DOCKERHUB_USERNAME }}/calculator-api:latest
+      run: docker push ${{ secrets.DOCKERHUB_USERNAME }}/bmi-calculator-api:latest
 
       # ----------------------------------------------------
     #  Docker Runtime Smoke Test (Node.js)
     # ----------------------------------------------------
     - name: Run container and test
       run: |
-        docker run -d -p 3000:3000 --name test-app ${{ secrets.DOCKERHUB_USERNAME }}/calculator-api:latest
+        docker run -d -p 3000:3000 --name test-app ${{ secrets.DOCKERHUB_USERNAME }}/bmi-calculator-api:latest
         sleep 10
         curl -f http://localhost:3000/health || exit 1
         docker logs test-app
