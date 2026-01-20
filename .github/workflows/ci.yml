@@ -1,0 +1,117 @@
+name: BMI CALCULATOR CI
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+        cache: npm
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Run unit tests
+      run: npm test
+
+    - name: Lint code
+      run: npm run lint
+
+    # ----------------------------------------------------
+    # SCA – OWASP Dependency Check (JavaScript)
+    # ----------------------------------------------------
+    - name: OWASP Dependency-Check (SCA)
+      uses: dependency-check/Dependency-Check_Action@main
+      with:
+        project: "calculator-api"
+        path: "."
+        format: "SARIF"
+        out: "dependency-check-report"
+        args: >
+          --enableExperimental
+          --nodeAuditSkipDevDependencies
+          --failOnCVSS 7
+
+    - name: Upload OWASP Dependency-Check SARIF
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: dependency-check-report/dependency-check-report.sarif
+
+    # ----------------------------------------------------
+    # SAST – CodeQL
+    # ----------------------------------------------------
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: javascript
+
+    - name: CodeQL Autobuild
+      uses: github/codeql-action/autobuild@v3
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v3
+
+    # ----------------------------------------------------
+    # Docker Build
+    # ----------------------------------------------------
+    - name: Build Docker image
+      run: docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/calculator-api:latest .
+
+    # ----------------------------------------------------
+    #  Trivy – Container Image Security Scan
+    # ----------------------------------------------------
+    - name: Trivy Image Scan
+      uses: aquasecurity/trivy-action@0.24.0
+      continue-on-error: true
+      with:
+        scan-type: image
+        image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/calculator-api:latest
+        vuln-type: os,library
+        severity: CRITICAL
+        ignore-unfixed: true
+        format: sarif
+        output: trivy-results.sarif
+
+
+    - name: Upload Trivy results to GitHub Security
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: trivy-results.sarif
+
+
+
+    - name: DockerHub login
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Push Docker image
+      run: docker push ${{ secrets.DOCKERHUB_USERNAME }}/calculator-api:latest
+
+      # ----------------------------------------------------
+    #  Docker Runtime Smoke Test (Node.js)
+    # ----------------------------------------------------
+    - name: Run container and test
+      run: |
+        docker run -d -p 3000:3000 --name test-app ${{ secrets.DOCKERHUB_USERNAME }}/calculator-api:latest
+        sleep 10
+        curl -f http://localhost:3000/health || exit 1
+        docker logs test-app
+        docker stop test-app
+        docker rm test-app
