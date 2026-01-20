@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: bmi-calculator-api
-        image: docker.io/<DOCKERHUB_USERNAME>/bmi-calculator-api:latest
+        image: ajaisharan/bmi-calculator-api
         ports:
         - containerPort: 3000
         env:
