@@ -1,37 +1,83 @@
 name: BMI Calculator CD
 
 on:
+  # Automatic: after CI succeeds for a push to main (CI has already published
+  # the commit-SHA image by then).
   workflow_run:
     workflows: ["BMI CALCULATOR CI"]
     types: [completed]
+    branches: [main]
+  # Manual: redeploy or roll back to any previously published commit.
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: "Full 40-character commit SHA whose published image should be deployed"
+        required: true
+
+permissions: {}
+
+# Never run two production deployments at once; queue instead of cancelling.
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  IMAGE_REPOSITORY: docker.io/ajaisharan/bmi-calculator-api
 
 jobs:
   deploy:
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') }}
     runs-on: ubuntu-latest
+    # Add required reviewers to this environment in repo settings for a manual approval gate.
+    environment: production
     permissions:
       contents: read
-      id-token: write
+    env:
+      COMMIT_SHA: ${{ github.event.workflow_run.head_sha || inputs.commit_sha }}
 
     steps:
-      - uses: actions/checkout@v4
-      
+      - name: Validate commit SHA
+        run: |
+          if ! [[ "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "commit_sha must be a full 40-character lowercase SHA" >&2
+            exit 1
+          fi
+
+      # Manifests come from the same commit as the image, so code and config match.
+      - name: Checkout the commit being deployed
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.COMMIT_SHA }}
+          persist-credentials: false
+
+      - name: Resolve published image digest
+        run: |
+          digest="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${COMMIT_SHA}" --format '{{json .Manifest}}' | jq -r .digest)"
+          test -n "$digest" && test "$digest" != "null"
+          echo "DEPLOY_IMAGE=${IMAGE_REPOSITORY}@${digest}" >> "$GITHUB_ENV"
+          echo "Deploying ${IMAGE_REPOSITORY}:${COMMIT_SHA} = ${digest}"
+
       - name: Install doctl
-        uses: digitalocean/action-doctl@v2
+        uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
 
-      - name: Save DigitalOcean kubeconfig
-        run: doctl kubernetes cluster kubeconfig save ${{ secrets.DIGITALOCEAN_CLUSTER_NAME }}
+      - name: Save DigitalOcean kubeconfig (short-lived credentials)
+        run: doctl kubernetes cluster kubeconfig save --expiry-seconds 1200 "${{ secrets.DIGITALOCEAN_CLUSTER_NAME }}"
 
+      - name: Deploy to Kubernetes (auto-rollback on failed rollout)
+        run: scripts/deploy.sh "$DEPLOY_IMAGE" "commit ${COMMIT_SHA} (CD run ${{ github.run_id }})"
 
-
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v4
-
-      - name: Deploy to Kubernetes
+      - name: Verify Rollout and user journey
         run: |
-          kubectl apply -f k8/deployment.yml
-
-      - name: Verify Rollout
-        run: kubectl rollout status deployment.apps/bmi-calculator-api
+          kubectl port-forward svc/bmi-calculator-api-service 8080:80 > /tmp/pf.log 2>&1 &
+          sleep 3
+          scripts/smoke-test.sh http://localhost:8080 "$COMMIT_SHA"
+          {
+            echo "### Production deployment"
+            echo "- Commit: \`${COMMIT_SHA}\`"
+            echo "- Image: \`${DEPLOY_IMAGE}\`"
+            echo '```'
+            kubectl rollout history deployment/bmi-calculator-api
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

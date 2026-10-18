@@ -1,117 +1,377 @@
+# The workflow name is referenced by cd.yml (workflow_run); keep them in sync.
 name: BMI CALCULATOR CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
   workflow_dispatch:
 
+# Least privilege: nothing by default, each job asks for what it needs.
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE_REPOSITORY: docker.io/ajaisharan/bmi-calculator-api
+  NODE_VERSION: "24"
+
 jobs:
-  ci:
+  # ----------------------------------------------------
+  # Unit tests, lint, production dependency audit
+  # ----------------------------------------------------
+  test:
+    name: Test, lint and audit
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
-      security-events: write
-
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: 20
-        cache: npm
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
 
-    - name: Install dependencies
-      run: npm ci
+      - name: Install dependencies
+        run: npm ci
 
-    - name: Run unit tests
-      run: npm test
+      - name: Lint code
+        run: npm run lint
 
-    - name: Lint code
-      run: npm run lint
+      - name: Run unit and API tests (with coverage threshold)
+        run: npm test
 
-    # ----------------------------------------------------
-    # SCA – OWASP Dependency Check (JavaScript)
-    # ----------------------------------------------------
-    - name: OWASP Dependency-Check (SCA)
-      uses: dependency-check/Dependency-Check_Action@main
-      with:
-        project: "bmi-calculator-api"
-        path: "."
-        format: "SARIF"
-        out: "dependency-check-report"
-        args: >
-          --enableExperimental
-          --disableNodeAudit
-          --failOnCVSS 7
+      - name: Audit production dependencies (fail on high/critical)
+        run: npm audit --omit=dev --audit-level=high
 
-    - name: Upload OWASP Dependency-Check SARIF
-      uses: github/codeql-action/upload-sarif@v3
-      with:
-        sarif_file: dependency-check-report/dependency-check-report.sarif
+  # ----------------------------------------------------
+  # SAST – CodeQL
+  # ----------------------------------------------------
+  codeql:
+    name: CodeQL (SAST)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-    # ----------------------------------------------------
-    # SAST – CodeQL
-    # ----------------------------------------------------
-    - name: Initialize CodeQL
-      uses: github/codeql-action/init@v3
-      with:
-        languages: javascript
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
 
-    - name: CodeQL Autobuild
-      uses: github/codeql-action/autobuild@v3
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
 
-    - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v3
+  # ----------------------------------------------------
+  # SCA – OWASP Dependency-Check (JavaScript)
+  # ----------------------------------------------------
+  dependency-check:
+    name: OWASP Dependency-Check (SCA)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-    # ----------------------------------------------------
-    # Docker Build
-    # ----------------------------------------------------
-    - name: Build Docker image
-      run: docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/bmi-calculator-api:latest .
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
 
-    # ----------------------------------------------------
-    #  Trivy – Container Image Security Scan
-    # ----------------------------------------------------
-    - name: Trivy Image Scan
-      uses: aquasecurity/trivy-action@0.24.0
-      continue-on-error: true
-      with:
-        scan-type: image
-        image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/bmi-calculator-api:latest
-        vuln-type: os,library
-        severity: CRITICAL
-        ignore-unfixed: true
-        format: sarif
-        output: trivy-results.sarif
+      - name: Install production dependencies
+        run: npm ci --omit=dev --ignore-scripts
 
+      - name: OWASP Dependency-Check (SCA)
+        # Pinned to a commit: this third-party action runs with the job token.
+        uses: dependency-check/Dependency-Check_Action@1e54355a8b4c8abaa8cc7d0b70aa655a3bb15a6c # main @ 2025-12-10
+        with:
+          project: "bmi-calculator-api"
+          path: "."
+          format: "SARIF"
+          out: "dependency-check-report"
+          args: >
+            --enableExperimental
+            --disableNodeAudit
+            --failOnCVSS 7
 
-    - name: Upload Trivy results to GitHub Security
-      uses: github/codeql-action/upload-sarif@v3
-      with:
-        sarif_file: trivy-results.sarif
+      - name: Upload OWASP Dependency-Check SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: dependency-check-report/dependency-check-report.sarif
+          category: dependency-check
 
+  # ----------------------------------------------------
+  # Docker build, Trivy scan, container smoke test
+  # ----------------------------------------------------
+  image:
+    name: Build, scan and smoke-test image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      IMAGE: docker.io/ajaisharan/bmi-calculator-api:${{ github.sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
+      - name: Build Docker image (tagged with commit SHA)
+        run: |
+          docker build \
+            --build-arg APP_VERSION=${{ github.sha }} \
+            -t "$IMAGE" .
+          docker image inspect "$IMAGE" --format 'id={{.Id}} user={{.Config.User}} revision={{index .Config.Labels "org.opencontainers.image.revision"}}'
 
-    - name: DockerHub login
-      uses: docker/login-action@v3
-      with:
-        username: ${{ secrets.DOCKERHUB_USERNAME }}
-        password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Verify image runs as non-root without package managers
+        run: |
+          test "$(docker image inspect "$IMAGE" --format '{{.Config.User}}')" = "1000:1000"
+          test "$(docker run --rm --entrypoint id "$IMAGE" -u)" = "1000"
+          docker run --rm --entrypoint sh "$IMAGE" -c '! command -v npm && ! command -v yarn'
+          echo "Image user is 1000:1000 and npm/yarn are absent"
 
-    - name: Push Docker image
-      run: docker push ${{ secrets.DOCKERHUB_USERNAME }}/bmi-calculator-api:latest
+      - name: Trivy Image Scan (report to GitHub Security)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE }}
+          vuln-type: os,library
+          severity: CRITICAL,HIGH,MEDIUM
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-results.sarif
 
-      # ----------------------------------------------------
-    #  Docker Runtime Smoke Test (Node.js)
-    # ----------------------------------------------------
-    - name: Run container and test
-      run: |
-        docker run -d -p 3000:3000 --name test-app ${{ secrets.DOCKERHUB_USERNAME }}/bmi-calculator-api:latest
-        sleep 10
-        curl -f http://localhost:3000/health || exit 1
-        docker logs test-app
-        docker stop test-app
-        docker rm test-app
+      - name: Upload Trivy results to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+
+      - name: Trivy gate (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE }}
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
+          skip-setup-trivy: true
+
+      - name: Run container and test (hardened runtime flags)
+        run: |
+          docker run -d --name test-app \
+            --read-only --cap-drop ALL --security-opt no-new-privileges \
+            -p 3000:3000 -p 9464:9464 "$IMAGE"
+          scripts/smoke-test.sh http://localhost:3000 "${{ github.sha }}"
+          curl -fsS http://localhost:9464/metrics | grep -E '^(bmi_calculations_total|app_info|http_requests_total)'
+
+      - name: Verify configurable port
+        run: |
+          docker run -d --name port-app -e PORT=8080 -p 8080:8080 "$IMAGE"
+          scripts/smoke-test.sh http://localhost:8080 "${{ github.sha }}"
+          docker rm -f port-app
+
+      - name: Verify graceful shutdown on SIGTERM
+        run: |
+          docker stop --time 25 test-app
+          docker logs test-app | tail -n 5
+          test "$(docker inspect test-app --format '{{.State.ExitCode}}')" = "0"
+          docker logs test-app | grep -q '"msg":"shutdown complete"'
+          docker rm test-app
+
+      - name: Export image for later jobs
+        run: docker save "$IMAGE" | gzip > image.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar.gz
+          retention-days: 3
+
+  # ----------------------------------------------------
+  # Publish: only after every required check passed
+  # ----------------------------------------------------
+  publish:
+    name: Publish commit-SHA image
+    needs: [test, codeql, dependency-check, image]
+    # main pushes publish automatically; manual dispatch publishes on demand.
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    env:
+      IMAGE: docker.io/ajaisharan/bmi-calculator-api:${{ github.sha }}
+    steps:
+      - name: Download scanned image
+        uses: actions/download-artifact@v4
+        with:
+          name: image
+
+      - name: Load the exact image that was tested and scanned
+        run: gunzip -c image.tar.gz | docker load
+
+      - name: DockerHub login
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push Docker image
+        id: push
+        run: |
+          docker push "$IMAGE"
+          digest="$(docker image inspect "$IMAGE" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep '^docker.io/ajaisharan/bmi-calculator-api@' | head -n1 | cut -d@ -f2)"
+          test -n "$digest"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Published image"
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Image: \`${IMAGE}\`"
+            echo "- Digest: \`${digest}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Move latest pointer (main only; never used for deployment)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          docker tag "$IMAGE" "${IMAGE_REPOSITORY}:latest"
+          docker push "${IMAGE_REPOSITORY}:latest"
+
+  # ----------------------------------------------------
+  # Deploy to an ephemeral kind cluster and verify
+  # ----------------------------------------------------
+  kubernetes:
+    name: Deploy to kind and verify (incl. rollback drill)
+    needs: [image, publish]
+    # Runs on PRs (publish skipped: uses the scanned image artifact) and after
+    # publishing (pulls the published image by digest from Docker Hub).
+    if: ${{ !cancelled() && needs.image.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SHA: ${{ github.sha }}
+      DIGEST: ${{ needs.publish.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Create kind cluster
+        run: |
+          kind version
+          kind create cluster --name bmi --wait 120s
+          kubectl version
+          kubectl get nodes -o wide
+
+      - name: Choose image source
+        run: |
+          if [ -n "$DIGEST" ]; then
+            echo "DEPLOY_IMAGE=${IMAGE_REPOSITORY}@${DIGEST}" >> "$GITHUB_ENV"
+            echo "Deploying published image ${IMAGE_REPOSITORY}@${DIGEST}"
+          else
+            echo "DEPLOY_IMAGE=${IMAGE_REPOSITORY}:${SHA}" >> "$GITHUB_ENV"
+            echo "LOAD_ARTIFACT=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Download scanned image (unpublished runs)
+        if: env.LOAD_ARTIFACT == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: image
+
+      - name: Load image into kind (unpublished runs)
+        if: env.LOAD_ARTIFACT == 'true'
+        run: |
+          gunzip -c image.tar.gz | docker load
+          kind load docker-image "${IMAGE_REPOSITORY}:${SHA}" --name bmi
+
+      - name: Deploy exact image and wait for rollout
+        run: scripts/deploy.sh "$DEPLOY_IMAGE" "commit ${SHA} (CI run ${{ github.run_id }})"
+
+      - name: Verify running version and user journey
+        run: |
+          kubectl get deploy,rs,pods,svc,pdb,cm -l app=bmi-calculator-api -o wide
+          kubectl get pods -l app=bmi-calculator-api -o jsonpath='{range .items[*]}{.metadata.name}{"  image="}{.spec.containers[0].image}{"  imageID="}{.status.containerStatuses[0].imageID}{"\n"}{end}'
+          kubectl port-forward svc/bmi-calculator-api-service 8080:80 > /tmp/pf-svc.log 2>&1 &
+          kubectl port-forward deploy/bmi-calculator-api 9464:9464 > /tmp/pf-metrics.log 2>&1 &
+          sleep 3
+          scripts/smoke-test.sh http://localhost:8080 "$SHA"
+          curl -fsS -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' "http://localhost:8080/bmi?weight=82&height=1.8"
+          echo
+          curl -fsS http://localhost:9464/metrics | grep -E '^(bmi_calculations_total|bmi_validation_failures_total|app_info|http_requests_total)'
+          echo "--- structured logs for the propagated trace ---"
+          kubectl logs -l app=bmi-calculator-api --tail=-1 --prefix | grep 4bf92f3577b34da6a3ce929d0e0e4736
+
+      - name: Verify pod security settings
+        run: |
+          pod="$(kubectl get pods -l app=bmi-calculator-api -o jsonpath='{.items[0].metadata.name}')"
+          kubectl exec "$pod" -- id
+          if kubectl exec "$pod" -- sh -c 'touch /app/x' 2>/dev/null; then echo "root filesystem is writable" >&2; exit 1; fi
+          echo "Container runs as uid 1000 with a read-only root filesystem"
+          test -z "$(kubectl exec "$pod" -- ls /var/run/secrets/kubernetes.io 2>/dev/null)"
+          echo "No service account token mounted"
+
+      - name: Rollback drill (deploy a bad image, expect automatic rollback)
+        run: |
+          # Probe the service throughout the failed rollout to show users are unaffected.
+          ( for _ in $(seq 1 90); do curl -s -o /dev/null -w '%{http_code}\n' "http://localhost:8080/bmi?weight=70&height=1.75"; sleep 1; done ) > /tmp/availability.log &
+          probe=$!
+          if ROLLOUT_TIMEOUT=45s scripts/deploy.sh "${IMAGE_REPOSITORY}:does-not-exist-${SHA}" "rollback drill: bad image"; then
+            echo "bad release unexpectedly succeeded" >&2; exit 1
+          fi
+          kill "$probe" || true
+          echo "Requests during bad rollout: $(grep -c '^200$' /tmp/availability.log) OK, $(grep -vc '^200$' /tmp/availability.log || true) failed"
+          test "$(grep -vc '^200$' /tmp/availability.log || true)" = "0"
+          current="$(kubectl get deploy bmi-calculator-api -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          echo "Image after rollback: ${current}"
+          test "$current" = "$DEPLOY_IMAGE"
+          kubectl rollout history deployment/bmi-calculator-api
+          scripts/smoke-test.sh http://localhost:8080 "$SHA"
+
+      - name: Record evidence
+        if: always()
+        run: |
+          {
+            echo "### Kubernetes deployment (kind)"
+            echo "- Commit: \`${SHA}\`"
+            echo "- Deployed image: \`${DEPLOY_IMAGE}\`"
+            echo '```'
+            kubectl get pods -l app=bmi-calculator-api -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.status.containerStatuses[0].imageID}{"\n"}{end}' || true
+            kubectl rollout history deployment/bmi-calculator-api || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl describe deployment bmi-calculator-api || true
+          kubectl describe pods -l app=bmi-calculator-api || true
+          kubectl logs -l app=bmi-calculator-api --tail=50 --prefix || true
+          kubectl get events --sort-by=.lastTimestamp || true
