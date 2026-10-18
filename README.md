@@ -117,7 +117,8 @@ is used.
 
 ## CI/CD and release flow
 
-1. **Checks:** `npm test`, `npm run lint`, `npm audit --omit=dev`, OWASP Dependency-Check, CodeQL.
+1. **Checks:** `npm test`, `npm run lint`, `npm audit --omit=dev`, OWASP Dependency-Check (run
+   after `npm prune --omit=dev`, so it scans only what ships in the image), CodeQL.
 2. **Build:** `docker build` with the image tagged `:<commit SHA>`. The SHA is also baked into
    the image and returned by `/health`.
 3. **Scan and test the image:** Trivy (the pipeline fails on fixable HIGH/CRITICAL), then run
