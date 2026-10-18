@@ -1,0 +1,13 @@
+.git
+.github
+.deploy
+.vscode
+node_modules
+coverage
+tests
+docs
+k8
+scripts
+*.md
+.env
+*.log

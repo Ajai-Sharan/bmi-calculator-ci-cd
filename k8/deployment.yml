@@ -1,3 +1,15 @@
+# Base manifests. Deploy with scripts/deploy.sh <image-ref>, which pins the exact
+# image (commit-SHA tag or digest) through a kustomize overlay; do not deploy :latest.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bmi-calculator-api
+  labels:
+    app: bmi-calculator-api
+# The app never calls the Kubernetes API, so it gets no token and no RBAC bindings.
+automountServiceAccountToken: false
+
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -5,7 +17,16 @@ metadata:
   labels:
     app: bmi-calculator-api
 spec:
-  replicas: 1
+  # Two stateless replicas so one can be replaced while the other serves traffic.
+  replicas: 2
+  revisionHistoryLimit: 5
+  # A rollout that makes no progress for this long is marked failed (triggers rollback in deploy.sh).
+  progressDeadlineSeconds: 120
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: bmi-calculator-api
@@ -13,32 +34,62 @@ spec:
     metadata:
       labels:
         app: bmi-calculator-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+        prometheus.io/path: /metrics
     spec:
+      serviceAccountName: bmi-calculator-api
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: bmi-calculator-api
-        image: ajaisharan/bmi-calculator-api
+        image: docker.io/ajaisharan/bmi-calculator-api
+        imagePullPolicy: IfNotPresent
         ports:
-        - containerPort: 3000
-        env:
-        - name: PORT
-          value: "3000"
+        - name: http
+          containerPort: 3000
+        - name: metrics
+          containerPort: 9464
+        # PORT, METRICS_PORT and LOG_LEVEL come from the generated ConfigMap
+        # (k8/kustomization.yml). PORT must match the "http" containerPort above.
+        envFrom:
+        - configMapRef:
+            name: bmi-calculator-api-config
 
         # ------------------------
         # Health Checks
         # ------------------------
+        # Liveness: restart the container if the process stops responding.
         livenessProbe:
           httpGet:
             path: /health
-            port: 3000
-          initialDelaySeconds: 10
+            port: http
+          initialDelaySeconds: 5
           periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 3
 
+        # Readiness: only route traffic once started, and stop during shutdown.
         readinessProbe:
           httpGet:
-            path: /health
-            port: 3000
-          initialDelaySeconds: 5
+            path: /ready
+            port: http
           periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 2
+
+        # Give endpoints time to drop this pod before the app starts draining.
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sleep", "5"]
 
         # ------------------------
         # Resource Management
@@ -51,19 +102,41 @@ spec:
             memory: "256Mi"
             cpu: "200m"
 
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+
 ---
+# Keep at least one replica up during voluntary disruptions (node drains, upgrades).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: bmi-calculator-api
+  labels:
+    app: bmi-calculator-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: bmi-calculator-api
+
+---
+# Public entry point: only the API port is exposed. The metrics port (9464) is
+# reachable inside the cluster for scraping but is not published here.
 apiVersion: v1
 kind: Service
 metadata:
   name: bmi-calculator-api-service
+  labels:
+    app: bmi-calculator-api
 spec:
   type: LoadBalancer
   selector:
     app: bmi-calculator-api
   ports:
-  - protocol: TCP
+  - name: http
+    protocol: TCP
     port: 80
-    targetPort: 3000
-
-
-
+    targetPort: http

@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - deployment.yml
+
+# Runtime configuration. The generated name carries a content hash, so editing
+# a value here changes the pod template and triggers a normal rolling update.
+configMapGenerator:
+  - name: bmi-calculator-api-config
+    literals:
+      - PORT=3000
+      - METRICS_PORT=9464
+      - LOG_LEVEL=info
