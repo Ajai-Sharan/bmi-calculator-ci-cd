@@ -1,40 +1,46 @@
-const express = require('express');
-const BMICalculator = require('./bmi');
+const { loadConfig } = require('./config');
+const { createLogger } = require('./logger');
+const { initTracing } = require('./tracing');
+const { createMetrics } = require('./metrics');
+const { createApp, createMetricsApp } = require('./app');
 
-const app = express();
-const PORT = 3000;
+const config = loadConfig();
+const logger = createLogger(config);
+const tracing = initTracing(config, logger);
+const metrics = createMetrics(config);
 
-app.use(express.json());
+let ready = false;
+const app = createApp({ config, logger, metrics, tracer: tracing.tracer, isReady: () => ready });
 
-app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'UP' });
+const server = app.listen(config.port, () => {
+    ready = true;
+    logger.info({ port: config.port, metricsPort: config.metricsPort }, 'BMI API listening');
 });
+const metricsServer = createMetricsApp(metrics.registry).listen(config.metricsPort);
 
-// Endpoint: GET /bmi?weight=70&height=1.75
-app.get('/bmi', (req, res) => {
-    try {
-        const weight = parseFloat(req.query.weight);
-        const height = parseFloat(req.query.height);
+function shutdown(signal) {
+    logger.info({ signal }, 'shutting down: draining in-flight requests');
+    ready = false;
 
-        if (!weight || !height) {
-            return res.status(400).json({ error: "Please provide 'weight' and 'height' query parameters." });
-        }
+    // Hard stop if connections do not drain within Kubernetes' grace period.
+    setTimeout(() => {
+        logger.error('graceful shutdown timed out');
+        process.exit(1);
+    }, 20000).unref();
 
-        const bmiValue = BMICalculator.calculate(weight, height);
-        const category = BMICalculator.getCategory(bmiValue);
-
-        res.json({
-            weight: weight,
-            height: height,
-            bmi: bmiValue,
-            category: category
+    server.close(() => {
+        metricsServer.close();
+        tracing.shutdown().finally(() => {
+            logger.info('shutdown complete');
+            process.exit(0);
         });
+    });
+    server.closeIdleConnections();
+}
 
-    } catch (error) {
-        res.status(400).json({ error: error.message });
-    }
-});
-
-app.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('uncaughtException', (err) => {
+    logger.fatal({ err }, 'uncaught exception');
+    process.exit(1);
 });
