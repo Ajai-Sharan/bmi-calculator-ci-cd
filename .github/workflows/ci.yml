@@ -2,41 +2,62 @@ name: BMI CALCULATOR CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
   workflow_dispatch:
+
+# Least privilege: read-only by default
+permissions:
+  contents: read
 
 jobs:
   ci:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
-      security-events: write
+      security-events: write   # upload CodeQL / Dependency-Check / Trivy results to GitHub Security
+
+    env:
+      # Every image is tagged with the commit SHA, so the running version is traceable
+      IMAGE: docker.io/ajaisharan/bmi-calculator-api:${{ github.sha }}
+      # Push to Docker Hub only for main (or a manual run); pull requests are checked but not published
+      PUBLISH: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: 20
+        node-version: 24
         cache: npm
 
     - name: Install dependencies
       run: npm ci
 
-    - name: Run unit tests
+    - name: Run unit and API tests
       run: npm test
 
     - name: Lint code
       run: npm run lint
 
+    - name: Audit production dependencies (fail on high/critical)
+      run: npm audit --omit=dev --audit-level=high
+
+    # Tests and lint are done; keep only the dependencies that ship in the image
+    # so Dependency-Check scans exactly what runs in production.
+    - name: Remove dev dependencies
+      run: npm prune --omit=dev
+
     # ----------------------------------------------------
     # SCA – OWASP Dependency Check (JavaScript)
     # ----------------------------------------------------
     - name: OWASP Dependency-Check (SCA)
-      uses: dependency-check/Dependency-Check_Action@main
+      uses: dependency-check/Dependency-Check_Action@1e54355a8b4c8abaa8cc7d0b70aa655a3bb15a6c # pinned commit instead of @main
       with:
         project: "bmi-calculator-api"
         path: "."
@@ -51,6 +72,7 @@ jobs:
       uses: github/codeql-action/upload-sarif@v3
       with:
         sarif_file: dependency-check-report/dependency-check-report.sarif
+        category: dependency-check
 
     # ----------------------------------------------------
     # SAST – CodeQL
@@ -60,58 +82,121 @@ jobs:
       with:
         languages: javascript
 
-    - name: CodeQL Autobuild
-      uses: github/codeql-action/autobuild@v3
-
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@v3
 
     # ----------------------------------------------------
-    # Docker Build
+    # Docker Build (tagged with the commit SHA)
     # ----------------------------------------------------
     - name: Build Docker image
-      run: docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/bmi-calculator-api:latest .
+      run: docker build --build-arg APP_VERSION=${{ github.sha }} -t "$IMAGE" .
 
     # ----------------------------------------------------
     #  Trivy – Container Image Security Scan
     # ----------------------------------------------------
-    - name: Trivy Image Scan
-      uses: aquasecurity/trivy-action@0.24.0
-      continue-on-error: true
+    - name: Trivy Image Scan (report)
+      uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
       with:
         scan-type: image
-        image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/bmi-calculator-api:latest
+        image-ref: ${{ env.IMAGE }}
         vuln-type: os,library
-        severity: CRITICAL
+        severity: CRITICAL,HIGH,MEDIUM
         ignore-unfixed: true
         format: sarif
         output: trivy-results.sarif
-
 
     - name: Upload Trivy results to GitHub Security
       uses: github/codeql-action/upload-sarif@v3
       with:
         sarif_file: trivy-results.sarif
+        category: trivy
 
+    - name: Trivy gate (fail on fixable HIGH/CRITICAL)
+      uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+      with:
+        scan-type: image
+        image-ref: ${{ env.IMAGE }}
+        vuln-type: os,library
+        severity: CRITICAL,HIGH
+        ignore-unfixed: true
+        exit-code: "1"
+        skip-setup-trivy: true
 
+    # ----------------------------------------------------
+    #  Docker Runtime Smoke Test (before publishing)
+    # ----------------------------------------------------
+    - name: Run container and test
+      run: |
+        docker run -d --name test-app --read-only --cap-drop ALL -p 3000:3000 "$IMAGE"
+        sleep 5
+        echo "Container user: $(docker exec test-app id -u)"
+        test "$(docker exec test-app id -u)" = "1000"
+        curl -fsS http://localhost:3000/health | grep "${{ github.sha }}"
+        curl -fsS "http://localhost:3000/bmi?weight=70&height=1.75" | grep '"bmi":22.86'
+        test "$(curl -s -o /dev/null -w '%{http_code}' 'http://localhost:3000/bmi?weight=70abc&height=1.75')" = "400"
+        curl -fsS http://localhost:3000/metrics | grep '^http_requests_total'
+        docker stop test-app
+        docker logs test-app
+        test "$(docker inspect test-app --format '{{.State.ExitCode}}')" = "0"
+        docker rm test-app
 
+    - name: Test configurable port
+      run: |
+        docker run -d --name port-app -e PORT=8080 -p 8080:8080 "$IMAGE"
+        sleep 5
+        curl -fsS http://localhost:8080/health
+        docker rm -f port-app
+
+    # ----------------------------------------------------
+    # Publish – only reached if every check above passed
+    # ----------------------------------------------------
     - name: DockerHub login
+      if: env.PUBLISH == 'true'
       uses: docker/login-action@v3
       with:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-    - name: Push Docker image
-      run: docker push ${{ secrets.DOCKERHUB_USERNAME }}/bmi-calculator-api:latest
+    - name: Push Docker image (commit SHA tag)
+      if: env.PUBLISH == 'true'
+      run: docker push "$IMAGE"
 
-      # ----------------------------------------------------
-    #  Docker Runtime Smoke Test (Node.js)
     # ----------------------------------------------------
-    - name: Run container and test
+    # Deploy the same version to Kubernetes (kind) and verify
+    # ----------------------------------------------------
+    - name: Create kind cluster
+      run: kind create cluster --name bmi --wait 120s
+
+    - name: Load image into kind (pull requests only; published images are pulled from Docker Hub)
+      if: env.PUBLISH != 'true'
+      run: kind load docker-image "$IMAGE" --name bmi
+
+    - name: Deploy to Kubernetes
+      run: scripts/deploy.sh ${{ github.sha }}
+
+    - name: Verify deployment and user request
       run: |
-        docker run -d -p 3000:3000 --name test-app ${{ secrets.DOCKERHUB_USERNAME }}/bmi-calculator-api:latest
-        sleep 10
-        curl -f http://localhost:3000/health || exit 1
-        docker logs test-app
-        docker stop test-app
-        docker rm test-app
+        kubectl get pods -o wide
+        kubectl get pods -l app=bmi-calculator-api -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.status.containerStatuses[0].imageID}{"\n"}{end}'
+        kubectl port-forward svc/bmi-calculator-api-service 8080:80 > /dev/null 2>&1 &
+        sleep 3
+        curl -fsS http://localhost:8080/health | grep "${{ github.sha }}"
+        curl -fsS -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' \
+          "http://localhost:8080/bmi?weight=70&height=1.75" | grep '"bmi":22.86'
+        echo
+        curl -fsS http://localhost:8080/metrics | grep '^http_requests_total'
+        kubectl logs -l app=bmi-calculator-api --prefix | grep 4bf92f3577b34da6a3ce929d0e0e4736
+        kubectl rollout history deployment/bmi-calculator-api
+
+    - name: Rollback test (deploy a broken version, expect automatic rollback)
+      run: |
+        if ROLLOUT_TIMEOUT=45s scripts/deploy.sh does-not-exist; then
+          echo "Broken version was not rejected" >&2
+          exit 1
+        fi
+        image="$(kubectl get deployment bmi-calculator-api -o jsonpath='{.spec.template.spec.containers[0].image}')"
+        echo "Image after rollback: $image"
+        test "$image" = "$IMAGE"
+        curl -fsS "http://localhost:8080/bmi?weight=70&height=1.75" | grep '"bmi":22.86'
+        echo "Rollback verified: previous version is serving requests"
+        kubectl rollout history deployment/bmi-calculator-api

@@ -4,34 +4,34 @@ on:
   workflow_run:
     workflows: ["BMI CALCULATOR CI"]
     types: [completed]
+    branches: [main]
 
 jobs:
   deploy:
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    # Runs only after CI succeeded for a push to main (CI has already pushed the image).
+    # Turned on by the repository variable ENABLE_DO_DEPLOY=true, because the
+    # DigitalOcean token currently stored in secrets is no longer valid.
+    if: ${{ vars.ENABLE_DO_DEPLOY == 'true' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
 
     steps:
+      # Check out the same commit that CI built, so manifest and image match
       - uses: actions/checkout@v4
-      
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
       - name: Install doctl
         uses: digitalocean/action-doctl@v2
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
 
-      - name: Save DigitalOcean kubeconfig
-        run: doctl kubernetes cluster kubeconfig save ${{ secrets.DIGITALOCEAN_CLUSTER_NAME }}
-
-
+      - name: Save DigitalOcean kubeconfig (short-lived)
+        run: doctl kubernetes cluster kubeconfig save --expiry-seconds 600 ${{ secrets.DIGITALOCEAN_CLUSTER_NAME }}
 
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
 
-      - name: Deploy to Kubernetes
-        run: |
-          kubectl apply -f k8/deployment.yml
-
-      - name: Verify Rollout
-        run: kubectl rollout status deployment.apps/bmi-calculator-api
+      - name: Deploy to Kubernetes and verify rollout (auto rollback on failure)
+        run: scripts/deploy.sh ${{ github.event.workflow_run.head_sha }}
