@@ -1,0 +1,10 @@
+node_modules
+coverage
+tests
+k8
+scripts
+docs
+.git
+.github
+.env
+*.md
