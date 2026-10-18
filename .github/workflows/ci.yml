@@ -48,6 +48,11 @@ jobs:
     - name: Audit production dependencies (fail on high/critical)
       run: npm audit --omit=dev --audit-level=high
 
+    # Tests and lint are done; keep only the dependencies that ship in the image
+    # so Dependency-Check scans exactly what runs in production.
+    - name: Remove dev dependencies
+      run: npm prune --omit=dev
+
     # ----------------------------------------------------
     # SCA – OWASP Dependency Check (JavaScript)
     # ----------------------------------------------------
