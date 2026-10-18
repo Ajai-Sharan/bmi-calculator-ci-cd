@@ -96,7 +96,7 @@ the publish and deploy jobs:
 | Secret | Used by |
 |---|---|
 | `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` | `publish` job (push image). Use a Docker Hub access token with Read & Write scope, not a password. |
-| `DIGITALOCEAN_ACCESS_TOKEN`, `DIGITALOCEAN_CLUSTER_NAME` | `cd.yml` (optional cloud cluster) |
+| `DIGITALOCEAN_ACCESS_TOKEN`, `DIGITALOCEAN_CLUSTER_NAME` | `cd.yml` (optional cloud cluster). Also set the repository **variable** `ENABLE_DO_DEPLOY=true` to turn it on. The token stored today is rejected by DigitalOcean (HTTP 401, see [docs/EVIDENCE.md](docs/EVIDENCE.md)) and must be rotated first. |
 
 ---
 
@@ -180,8 +180,8 @@ commit ─► PR / push ─► CI ───────────────�
                         │ → user journey, version, metrics, trace logs, pod security
                         │ → rollback drill: bad image → auto rollback → zero failed requests
                         ▼
-                     CD (cd.yml, after CI success on main): checkout the same commit →
-                        resolve digest of :<sha> → deploy.sh (auto rollback) → smoke test
+                     CD (cd.yml, after CI success on main; opt-in via ENABLE_DO_DEPLOY): checkout
+                        the same commit → resolve digest of :<sha> → deploy.sh (auto rollback) → smoke test
 ```
 
 - **Traceability.** Every image is tagged with the full commit SHA and carries it in the
@@ -293,16 +293,18 @@ known SHA through CD keeps the deployed version traceable.
 | No spans in logs for `/health` | By design: probes are not traced |
 | `deploy.sh` exits 2 | Image not pinned (`:latest` or no tag) |
 | CI `publish` job skipped | Expected on PRs; it only runs on push to `main` or manual dispatch, and only if all checks passed |
-| CD did not run | It runs only after a **successful** CI on a **push to main**; otherwise run it manually with `commit_sha` |
+| CD did not run | It runs only when the variable `ENABLE_DO_DEPLOY` is `true`, and then only after a **successful** CI on a **push to main** (or manually with `commit_sha`) |
+| CD fails at "Install doctl" with `401` | The DigitalOcean token is invalid or revoked; create a new one and update the secret |
 
 ---
 
 ## 9. Known limitations
 
 See [docs/EVIDENCE.md](docs/EVIDENCE.md#limitations) for what was and was not verified. In brief:
-- The verified Kubernetes target is an ephemeral **kind** cluster inside GitHub Actions. The
-  DigitalOcean CD path (`cd.yml`) is retained and updated, but runs only after merge to `main`
-  and depends on that cluster still existing.
+- The verified Kubernetes target is an ephemeral **kind** cluster inside GitHub Actions (and the
+  same `scripts/deploy.sh` works against a local kind/Minikube cluster). The DigitalOcean CD path
+  (`cd.yml`) is retained and updated but is **not verified**. The stored DigitalOcean token is
+  rejected (HTTP 401), so it is opt-in via `ENABLE_DO_DEPLOY` until credentials are rotated.
 - No bundled Prometheus/Grafana or tracing backend. Metrics are scrape-ready and traces are
   emitted as structured log lines.
 - No NetworkPolicy, HPA or image signing/SBOM yet (see [docs/DESIGN.md](docs/DESIGN.md)).

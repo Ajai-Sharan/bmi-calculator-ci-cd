@@ -46,7 +46,9 @@ several environments or many values, or to distribute the chart to others.
   release is deployable but does not run it for users.
 - **CD to a long-lived cluster** (DigitalOcean, retained from the baseline) runs only for `main`,
   checks out the same commit as the image, and can be gated by required reviewers on the
-  `production` environment. A **pull-based GitOps** tool such as Argo CD would add drift
+  `production` environment. It is **opt-in** (`ENABLE_DO_DEPLOY=true`) because the stored cloud
+  token is currently rejected. A pipeline that fails on every merge for reasons unrelated to
+  the change trains people to ignore red builds. A **pull-based GitOps** tool such as Argo CD would add drift
   detection and self-healing, but it is another controller to run and secure. Push-based CD is
   enough for one service and one cluster.
 - **`latest`** is still moved on `main` for backward compatibility with anything pulling it.

@@ -26,7 +26,10 @@ env:
 
 jobs:
   deploy:
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') }}
+    # Opt-in: set repository variable ENABLE_DO_DEPLOY=true once valid DigitalOcean
+    # credentials and a cluster exist. Without it this workflow is skipped and the
+    # kind deployment in CI remains the verified Kubernetes target.
+    if: ${{ vars.ENABLE_DO_DEPLOY == 'true' && (github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')) }}
     runs-on: ubuntu-latest
     # Add required reviewers to this environment in repo settings for a manual approval gate.
     environment: production
