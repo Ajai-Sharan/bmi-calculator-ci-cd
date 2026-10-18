@@ -245,8 +245,8 @@ jobs:
       - name: Push Docker image
         id: push
         run: |
-          docker push "$IMAGE"
-          digest="$(docker image inspect "$IMAGE" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep '^docker.io/ajaisharan/bmi-calculator-api@' | head -n1 | cut -d@ -f2)"
+          docker push "$IMAGE" | tee push.log
+          digest="$(grep -oE 'digest: sha256:[0-9a-f]{64}' push.log | cut -d' ' -f2)"
           test -n "$digest"
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
           {
